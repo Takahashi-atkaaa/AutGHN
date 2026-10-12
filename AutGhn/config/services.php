@@ -7,6 +7,17 @@ return [
         'webhook_secret' => env('TELEGRAM_WEBHOOK_SECRET'),
     ],
 
+    'ai' => [
+        'api_key' => env('AI_API_KEY'),
+        'model' => env('AI_MODEL'),
+    ],
+
+    'ghn' => [
+        'token' => env('GHN_TOKEN'),
+        'base_url' => env('GHN_BASE_URL', 'https://online-gateway.ghn.vn/shiip/public-api'),
+        'webhook_secret' => env('GHN_WEBHOOK_SECRET'),
+    ],
+
     /*
     |--------------------------------------------------------------------------
     | Third Party Services
