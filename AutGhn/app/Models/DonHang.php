@@ -25,6 +25,7 @@ class DonHang extends Model
         'ghi_chu',
         'do_tin_cay_ai',
         'trang_thai',
+        'nguon',
     ];
 
     protected function casts(): array

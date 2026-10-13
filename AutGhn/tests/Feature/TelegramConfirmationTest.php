@@ -352,4 +352,295 @@ class TelegramConfirmationTest extends TestCase
         $this->assertEquals(10, $kienHang->cao);
         $this->assertEquals(500, $kienHang->can_nang);
     }
+
+    /**
+     * Khi user chi nhap kich thuoc ma khong co can nang, bot phai doi trang thai don_hang
+     * sang cho_can_nang va luu tam kich thuoc vao du_lieu_ai.
+     * Khong tao KienHang ngay.
+     */
+    public function test_thieu_can_nang_hoi_lai(): void
+    {
+        $this->guiMessage();
+        $this->guiCallback('xac_nhan');
+
+        $tinNhan = TinNhanTelegram::where('ma_kenh', (string) $this->chatId)->first();
+        $donHang = DonHang::where('tin_nhan_telegram_id', $tinNhan->id)->first();
+        $this->assertEquals('cho_kien_hang', $donHang->trang_thai);
+
+        // User chi nhap kich thuoc, khong co can nang
+        $response = $this->postJson('/api/telegram/webhook', [
+            'message' => [
+                'message_id' => 201,
+                'chat' => ['id' => $this->chatId],
+                'from' => ['id' => 111222333, 'first_name' => 'Test', 'username' => 'testuser'],
+                'date' => time(),
+                'text' => '20x30x10',
+            ],
+        ], [
+            'X-Telegram-Bot-Api-Secret-Token' => 'test_secret',
+        ]);
+
+        $response->assertOk()->assertJson(['success' => true]);
+
+        $donHang->refresh();
+        $this->assertEquals('cho_can_nang', $donHang->trang_thai);
+
+        // KienHang chua duoc tao
+        $kienHang = KienHang::where('don_hang_id', $donHang->id)->first();
+        $this->assertNull($kienHang);
+
+        // Kich thuoc duoc luu tam trong du_lieu_ai
+        $tinNhan->refresh();
+        $this->assertArrayHasKey('_kich_thuoc_cho_can_nang', $tinNhan->du_lieu_ai ?? []);
+        $this->assertEquals(20, $tinNhan->du_lieu_ai['_kich_thuoc_cho_can_nang']['dai']);
+        $this->assertEquals(30, $tinNhan->du_lieu_ai['_kich_thuoc_cho_can_nang']['rong']);
+        $this->assertEquals(10, $tinNhan->du_lieu_ai['_kich_thuoc_cho_can_nang']['cao']);
+    }
+
+    /**
+     * Sau khi duoc hoi can nang, user nhap "1.2kg" -> parse thanh 1200g, KienHang duoc tao.
+     */
+    public function test_can_nang_don_vi_kg(): void
+    {
+        $this->guiMessage();
+        $this->guiCallback('xac_nhan');
+
+        $tinNhan = TinNhanTelegram::where('ma_kenh', (string) $this->chatId)->first();
+        $donHang = DonHang::where('tin_nhan_telegram_id', $tinNhan->id)->first();
+
+        // Buoc 1: nhap kich thuoc (khong can nang)
+        $this->postJson('/api/telegram/webhook', [
+            'message' => [
+                'message_id' => 201,
+                'chat' => ['id' => $this->chatId],
+                'from' => ['id' => 111222333, 'first_name' => 'Test', 'username' => 'testuser'],
+                'date' => time(),
+                'text' => '20x30x10',
+            ],
+        ], [
+            'X-Telegram-Bot-Api-Secret-Token' => 'test_secret',
+        ]);
+
+        $donHang->refresh();
+        $this->assertEquals('cho_can_nang', $donHang->trang_thai);
+
+        // Buoc 2: nhap can nang bang kg
+        $response = $this->postJson('/api/telegram/webhook', [
+            'message' => [
+                'message_id' => 202,
+                'chat' => ['id' => $this->chatId],
+                'from' => ['id' => 111222333, 'first_name' => 'Test', 'username' => 'testuser'],
+                'date' => time(),
+                'text' => '1.2kg',
+            ],
+        ], [
+            'X-Telegram-Bot-Api-Secret-Token' => 'test_secret',
+        ]);
+
+        $response->assertOk()->assertJson(['success' => true]);
+
+        $donHang->refresh();
+        $this->assertEquals('da_nhap_kien', $donHang->trang_thai);
+
+        $kienHang = KienHang::where('don_hang_id', $donHang->id)->first();
+        $this->assertNotNull($kienHang);
+        $this->assertEquals(20, $kienHang->dai);
+        $this->assertEquals(30, $kienHang->rong);
+        $this->assertEquals(10, $kienHang->cao);
+        $this->assertEquals(1200, $kienHang->can_nang);
+
+        // Co tam trong du_lieu_ai phai duoc xoa
+        $tinNhan->refresh();
+        $this->assertArrayNotHasKey('_kich_thuoc_cho_can_nang', $tinNhan->du_lieu_ai ?? []);
+    }
+
+    /**
+     * Khi user nhap chuoi khong phai kich thuoc (VD: "abc"), bot phai bao sai dinh dang
+     * va khong thay doi trang thai.
+     */
+    public function test_kich_thuoc_sai_dinh_dang_khong_tao_kien(): void
+    {
+        $this->guiMessage();
+        $this->guiCallback('xac_nhan');
+
+        $tinNhan = TinNhanTelegram::where('ma_kenh', (string) $this->chatId)->first();
+        $donHang = DonHang::where('tin_nhan_telegram_id', $tinNhan->id)->first();
+        $this->assertEquals('cho_kien_hang', $donHang->trang_thai);
+
+        // Nhap sai dinh dang
+        $response = $this->postJson('/api/telegram/webhook', [
+            'message' => [
+                'message_id' => 201,
+                'chat' => ['id' => $this->chatId],
+                'from' => ['id' => 111222333, 'first_name' => 'Test', 'username' => 'testuser'],
+                'date' => time(),
+                'text' => 'abc xyz',
+            ],
+        ], [
+            'X-Telegram-Bot-Api-Secret-Token' => 'test_secret',
+        ]);
+
+        $response->assertOk()->assertJson(['success' => true]);
+
+        // Trang thai van nguyen (cho_kien_hang)
+        $donHang->refresh();
+        $this->assertEquals('cho_kien_hang', $donHang->trang_thai);
+
+        // KienHang khong duoc tao
+        $this->assertNull(KienHang::where('don_hang_id', $donHang->id)->first());
+
+        // Co tam khong xuat hien
+        $tinNhan->refresh();
+        $this->assertArrayNotHasKey('_kich_thuoc_cho_can_nang', $tinNhan->du_lieu_ai ?? []);
+    }
+
+    /**
+     * Lenh /cancel khi chua co thao tac nao dang thuc hien -> thong bao khong co gi de huy.
+     */
+    public function test_cancel_khi_khong_co_thao_tac(): void
+    {
+        $response = $this->postJson('/api/telegram/webhook', [
+            'message' => [
+                'message_id' => 300,
+                'chat' => ['id' => $this->chatId],
+                'from' => ['id' => 111222333, 'first_name' => 'Test', 'username' => 'testuser'],
+                'date' => time(),
+                'text' => '/cancel',
+            ],
+        ], [
+            'X-Telegram-Bot-Api-Secret-Token' => 'test_secret',
+        ]);
+
+        $response->assertOk()->assertJson(['success' => true]);
+
+        // Khong co ban ghi tin_nhan nao duoc tao o trang thai da_phan_tich/da_xac_nhan
+        $this->assertNull(
+            TinNhanTelegram::where('ma_kenh', (string) $this->chatId)
+                ->whereIn('trang_thai', ['da_phan_tich', 'da_xac_nhan', 'cho_sua'])
+                ->first()
+        );
+    }
+
+    /**
+     * Lenh /cancel o trang thai da_xac_nhan (cho nhap kich thuoc) phai:
+     * - Danh dau tin_nhan.trang_thai = 'da_huy'
+     * - Danh dau don_hang.trang_thai = 'da_huy'
+     * - Xoa KienHang lien ket neu co
+     */
+    public function test_cancel_huy_don_hang_va_xoa_kien(): void
+    {
+        // Setup: xac nhan don + nhap kich thuoc de co KienHang
+        $this->guiMessage();
+        $this->guiCallback('xac_nhan');
+
+        $tinNhan = TinNhanTelegram::where('ma_kenh', (string) $this->chatId)->first();
+        $donHang = DonHang::where('tin_nhan_telegram_id', $tinNhan->id)->first();
+        $this->assertEquals('da_xac_nhan', $tinNhan->trang_thai);
+        $this->assertEquals('cho_kien_hang', $donHang->trang_thai);
+
+        // Nhap kich thuoc de tao KienHang
+        $this->postJson('/api/telegram/webhook', [
+            'message' => [
+                'message_id' => 201,
+                'chat' => ['id' => $this->chatId],
+                'from' => ['id' => 111222333, 'first_name' => 'Test', 'username' => 'testuser'],
+                'date' => time(),
+                'text' => '20x30x10 500g',
+            ],
+        ], [
+            'X-Telegram-Bot-Api-Secret-Token' => 'test_secret',
+        ]);
+
+        $donHang->refresh();
+        $this->assertEquals('da_nhap_kien', $donHang->trang_thai);
+        $this->assertNotNull(KienHang::where('don_hang_id', $donHang->id)->first());
+
+        // Gui /cancel
+        $response = $this->postJson('/api/telegram/webhook', [
+            'message' => [
+                'message_id' => 301,
+                'chat' => ['id' => $this->chatId],
+                'from' => ['id' => 111222333, 'first_name' => 'Test', 'username' => 'testuser'],
+                'date' => time(),
+                'text' => '/cancel',
+            ],
+        ], [
+            'X-Telegram-Bot-Api-Secret-Token' => 'test_secret',
+        ]);
+
+        $response->assertOk()->assertJson(['success' => true]);
+
+        // tin_nhan da huy
+        $tinNhan->refresh();
+        $this->assertEquals('da_huy', $tinNhan->trang_thai);
+
+        // don_hang da huy
+        $donHang->refresh();
+        $this->assertEquals('da_huy', $donHang->trang_thai);
+
+        // KienHang da bi xoa
+        $this->assertNull(KienHang::where('don_hang_id', $donHang->id)->first());
+    }
+
+    /**
+     * Lenh /cancel o trang thai cho_can_nang phai:
+     * - Danh dau tin_nhan.trang_thai = 'da_huy'
+     * - Danh dau don_hang.trang_thai = 'da_huy'
+     * - Xoa co tam _kich_thuoc_cho_can_nang trong du_lieu_ai
+     */
+    public function test_cancel_trang_thai_cho_can_nang(): void
+    {
+        $this->guiMessage();
+        $this->guiCallback('xac_nhan');
+
+        $tinNhan = TinNhanTelegram::where('ma_kenh', (string) $this->chatId)->first();
+        $donHang = DonHang::where('tin_nhan_telegram_id', $tinNhan->id)->first();
+
+        // Nhap kich thuoc (khong co can nang) -> cho_can_nang
+        $this->postJson('/api/telegram/webhook', [
+            'message' => [
+                'message_id' => 201,
+                'chat' => ['id' => $this->chatId],
+                'from' => ['id' => 111222333, 'first_name' => 'Test', 'username' => 'testuser'],
+                'date' => time(),
+                'text' => '20x30x10',
+            ],
+        ], [
+            'X-Telegram-Bot-Api-Secret-Token' => 'test_secret',
+        ]);
+
+        $donHang->refresh();
+        $this->assertEquals('cho_can_nang', $donHang->trang_thai);
+
+        // Kich thuoc tam da duoc luu
+        $tinNhan->refresh();
+        $this->assertArrayHasKey('_kich_thuoc_cho_can_nang', $tinNhan->du_lieu_ai ?? []);
+
+        // Gui /cancel
+        $response = $this->postJson('/api/telegram/webhook', [
+            'message' => [
+                'message_id' => 301,
+                'chat' => ['id' => $this->chatId],
+                'from' => ['id' => 111222333, 'first_name' => 'Test', 'username' => 'testuser'],
+                'date' => time(),
+                'text' => '/cancel',
+            ],
+        ], [
+            'X-Telegram-Bot-Api-Secret-Token' => 'test_secret',
+        ]);
+
+        $response->assertOk()->assertJson(['success' => true]);
+
+        $tinNhan->refresh();
+        $this->assertEquals('da_huy', $tinNhan->trang_thai);
+
+        $donHang->refresh();
+        $this->assertEquals('da_huy', $donHang->trang_thai);
+
+        // Co tam da bi xoa
+        $this->assertArrayNotHasKey('_kich_thuoc_cho_can_nang', $tinNhan->du_lieu_ai ?? []);
+
+        // KienHang chua tung duoc tao
+        $this->assertNull(KienHang::where('don_hang_id', $donHang->id)->first());
+    }
 }

@@ -66,6 +66,16 @@ class GhnService
             'service_type_id' => 2, // 2 = Express, 1 = Standard
         ];
 
+        if (empty($diaChiChuan['district_id']) || empty($diaChiChuan['ward_code'])) {
+            $loi = 'Dia chi chua du ma quan/huyen va ma phuong/xa GHN.';
+            $this->luuLanTinhPhi($donHang, $shop, $payload, [], false, $loi);
+
+            return [
+                'success' => false,
+                'error' => $loi,
+            ];
+        }
+
         try {
             $response = Http::withHeaders([
                 'Token' => $this->token,

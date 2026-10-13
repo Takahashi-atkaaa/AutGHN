@@ -92,3 +92,24 @@ Hoàn thiện xác thực webhook và bảo vệ CRUD shop, sau đó viết test
 ## Nhiệm vụ tiếp theo
 
 Kiểm tra và hoàn thiện parser kích thước kiện hàng, sau đó mock API GHN cho tính phí. Cần giữ mọi request API ngoài ở chế độ mock cho đến khi có phê duyệt gọi GHN thật.
+
+## Giai đoạn 4 - Chặn tính phí khi địa chỉ chưa hợp lệ
+
+### Đã thực hiện
+
+- `GhnService::tinhPhiShip()` không gọi API GHN nếu chưa có `district_id` và `ward_code` hợp lệ.
+- Lỗi được lưu vào `lan_tinh_phi` gắn với đúng đơn hàng để có lịch sử và có thể xử lý lại sau.
+- Thêm test đảm bảo request GHN không được gửi với địa chỉ chưa map.
+
+### Kiểm chứng
+
+- `php artisan test`: **29 tests, 73 assertions passed**.
+- API ngoài được mock; không phát sinh request GHN thật.
+
+### Blocker thực tế
+
+`chuanHoaDiaChi()` vẫn cần cơ chế map địa chỉ tự do sang mã quận/huyện và phường/xã GHN. Không được tự đoán mã. Cần chọn một trong hai hướng: lưu mã GHN khi cấu hình shop/đơn, hoặc triển khai tra cứu danh mục GHN theo tài liệu và yêu cầu người dùng xác nhận kết quả.
+
+## Nhiệm vụ tiếp theo
+
+Thiết kế dữ liệu/luồng nhập mã địa chỉ GHN rõ ràng, sau đó thêm test mock thành công cho tính phí và tạo vận đơn. Chưa gọi GHN thật.

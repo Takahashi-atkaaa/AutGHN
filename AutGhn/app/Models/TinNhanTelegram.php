@@ -17,6 +17,7 @@ class TinNhanTelegram extends Model
         'noi_dung_goc',
         'du_lieu_ai',
         'trang_thai',
+        'nguon',
     ];
 
     protected function casts(): array

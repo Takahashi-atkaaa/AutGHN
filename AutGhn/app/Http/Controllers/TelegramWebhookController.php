@@ -16,6 +16,19 @@ use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Log;
 use InvalidArgumentException;
 
+/**
+ * Ket qua phan tich kich thuoc kien hang.
+ * - OK: du D x R x C va can nang
+ * - THIEU_CAN_NANG: co D x R x C nhung khong co can nang -> can hoi lai
+ * - SAI_DINH_DANG: khong parse duoc
+ */
+enum ParseKichThuocResult: string
+{
+    case OK = 'ok';
+    case THIEU_CAN_NANG = 'thieu_can_nang';
+    case SAI_DINH_DANG = 'sai_dinh_dang';
+}
+
 class TelegramWebhookController extends Controller
 {
     public function handle(Request $request, TelegramService $telegram, AIOrderParserService $ai): JsonResponse
@@ -38,6 +51,12 @@ class TelegramWebhookController extends Controller
         $tinNhan = $data['message'] ?? $data['edited_message'] ?? null;
         if (! is_array($tinNhan) || ! isset($tinNhan['message_id'], $tinNhan['chat']['id'])) {
             return response()->json(['success' => true, 'message' => 'Bo qua su kien khong phai tin nhan']);
+        }
+
+        // Xu ly lenh khi user go "/" (vi du: /start, /help, /cancel).
+        // Phan nhanh o day truoc khi luu tin nhan vao DB va truoc khi goi AI.
+        if (isset($tinNhan['text']) && is_string($tinNhan['text']) && str_starts_with(ltrim($tinNhan['text']), '/')) {
+            return $this->xuLyLenh($tinNhan, $telegram);
         }
 
         $maTinNhan = $tinNhan['chat']['id'].'_'.$tinNhan['message_id'];
@@ -81,13 +100,13 @@ class TelegramWebhookController extends Controller
             }
         }
 
-        // Neu don hang dang cho nhap kien / da nhap kien (cho chon shop) thi xu ly,
+        // Neu don hang dang cho nhap kien / cho can nang / da nhap kien (cho chon shop) thi xu ly,
         // khong goi AI
         if ($banGhi->wasRecentlyCreated && $noiDung !== '') {
             $banGhiTrongFlow = TinNhanTelegram::where('ma_kenh', (string) $tinNhan['chat']['id'])
                 ->whereIn('trang_thai', ['da_xac_nhan', 'cho_sua'])
                 ->whereHas('donHang', function ($query) {
-                    $query->whereIn('trang_thai', ['cho_kien_hang', 'da_nhap_kien']);
+                    $query->whereIn('trang_thai', ['cho_kien_hang', 'cho_can_nang', 'da_nhap_kien']);
                 })
                 ->orderBy('id', 'desc')
                 ->first();
@@ -494,6 +513,126 @@ class TelegramWebhookController extends Controller
             . 'Ghi chu: '.($duLieu['note'] ?? 'Chua co');
     }
 
+    /**
+     * Xu ly cac lenh (commands) ma user go trong Telegram: /start, /help, /cancel.
+     * Bo qua viec luu tin nhan vao DB va khong goi AI.
+     */
+    private function xuLyLenh(array $tinNhan, TelegramService $telegram): JsonResponse
+    {
+        $chatId = $tinNhan['chat']['id'];
+        $text = trim((string) ($tinNhan['text'] ?? ''));
+        // Lay phan dau tien (command), bo qua cac tham so phia sau.
+        $command = strtolower((string) (explode(' ', $text)[0] ?? ''));
+        // Loai bo suffix @username_bot neu co (vd /start@MyBot).
+        $command = (string) preg_replace('/@\w+$/', '', $command);
+
+        $banPhim = [
+            [['text' => '/start'], ['text' => '/help']],
+            [['text' => '/cancel']],
+        ];
+
+        switch ($command) {
+            case '/start':
+                $telegram->guiTinNhanCoBanPhim(
+                    $chatId,
+                    "Xin chao! Day la bot GHN247.\n\n"
+                    . "Ban co the:\n"
+                    . "- Gui tin nhan don hang binh thuong (vi du: 'Nguyen Van A, 0912345678, 123 Nguyen Trai Q1, 1 ao phong 250k').\n"
+                    . "- Go /help de xem huong dan chi tiet.\n"
+                    . "- Go /cancel neu muon huy thao tac dang thuc hien.",
+                    $banPhim,
+                    motLan: true,
+                );
+                break;
+
+            case '/help':
+                $noiDung = "=== HUONG DAN SU DUNG ===\n\n"
+                    . "1. Gui tin nhan don hang theo dang:\n"
+                    . "   Ten, SDT, dia chi, hang, tien COD\n"
+                    . "   Vi du: 'Nguyen Van A, 0912345678, 123 Nguyen Trai Q1, 1 ao phong 250k'\n\n"
+                    . "2. Bot se phan tich va hoi ban xac nhan.\n\n"
+                    . "3. Sau khi xac nhan, nhap kich thuoc kien hang:\n"
+                    . "   Vi du: '20x30x10 500g'\n\n"
+                    . "4. Chon shop GHN de tinh phi ship.\n\n"
+                    . "5. Xac nhan de tao van don.";
+                $telegram->guiTinNhanCoBanPhim($chatId, $noiDung, $banPhim, motLan: true);
+                break;
+
+            case '/cancel':
+                $tinNhanTrongFlow = TinNhanTelegram::where('ma_kenh', (string) $chatId)
+                    ->whereIn('trang_thai', ['da_phan_tich', 'da_xac_nhan', 'cho_sua'])
+                    ->orderBy('id', 'desc')
+                    ->first();
+
+                if (!$tinNhanTrongFlow) {
+                    $telegram->guiTinNhan($chatId, 'Khong co thao tac nao dang thuc hien.');
+                    break;
+                }
+
+                // Huy don hang lien ket neu co (o cac trang thai chua tao van don that)
+                $donHang = DonHang::where('tin_nhan_telegram_id', $tinNhanTrongFlow->id)
+                    ->whereIn('trang_thai', ['cho_kien_hang', 'cho_can_nang', 'da_nhap_kien', 'da_tinh_phi', 'da_chon_shop'])
+                    ->orderBy('id', 'desc')
+                    ->first();
+
+                $chiTiet = [];
+
+                if ($donHang) {
+                    // Xoa cung KienHang (du lieu staging, chua gui len GHN)
+                    $soKienHang = $donHang->kienHang()->count();
+                    if ($soKienHang > 0) {
+                        $donHang->kienHang()->delete();
+                        $chiTiet[] = "xoa {$soKienHang} kien hang";
+                    }
+
+                    // Xoa cung LanTinhPhi (ket qua tinh phi tam)
+                    $soLanTinhPhi = $donHang->lanTinhPhis()->count();
+                    if ($soLanTinhPhi > 0) {
+                        $donHang->lanTinhPhis()->delete();
+                        $chiTiet[] = "xoa {$soLanTinhPhi} lan tinh phi";
+                    }
+
+                    // Danh dau don_hang da huy
+                    $donHang->update(['trang_thai' => 'da_huy']);
+                    $chiTiet[] = "don hang {$donHang->ma_don_noi_bo}";
+                }
+
+                // Xoa co tam _kich_thuoc_cho_can_nang neu co
+                $duLieuAi = $tinNhanTrongFlow->du_lieu_ai ?? [];
+                if (isset($duLieuAi['_kich_thuoc_cho_can_nang'])) {
+                    unset($duLieuAi['_kich_thuoc_cho_can_nang']);
+                    $tinNhanTrongFlow->update(['du_lieu_ai' => $duLieuAi]);
+                }
+
+                // Danh dau tin nhan da huy
+                $tinNhanTrongFlow->update(['trang_thai' => 'da_huy']);
+
+                $thongBao = 'Da huy thao tac dang thuc hien.';
+                if (!empty($chiTiet)) {
+                    $thongBao .= "\n" . implode(', ', $chiTiet) . '.';
+                }
+                $telegram->guiTinNhan($chatId, $thongBao);
+
+                Log::info('Huy thao tac qua /cancel', [
+                    'ma_tin_nhan' => $tinNhanTrongFlow->ma_tin_nhan,
+                    'don_hang_id' => $donHang?->id,
+                    'ma_don' => $donHang?->ma_don_noi_bo,
+                ]);
+                break;
+
+            default:
+                $telegram->guiTinNhan($chatId, 'Lenh khong hop le. Go /help de xem huong dan.');
+                break;
+        }
+
+        Log::info('Telegram command', [
+            'chat_id' => $chatId,
+            'command' => $command,
+        ]);
+
+        return response()->json(['success' => true]);
+    }
+
     // ==================== CAC METHOD MOI CHO TAO DON HANG ====================
 
     private function xuLyChonShop(TinNhanTelegram $banGhi, int $shopId, string $callbackId, TelegramService $telegram, GhnService $ghnService): JsonResponse
@@ -530,6 +669,7 @@ class TelegramWebhookController extends Controller
         // Tính phí ship
         $phiShip = 0;
         $dichVuText = '';
+        $loiPhiShip = null;
 
         if ($diaChiNhan) {
             try {
@@ -541,9 +681,11 @@ class TelegramWebhookController extends Controller
                     'shop_id' => $shop->id,
                     'error' => $e->getMessage(),
                 ]);
-                $telegram->guiTinNhan(
-                    $banGhi->layMaKenh(),
-                    "Loi khi tinh phi ship: {$e->getMessage()}"
+                // Hien thi loi qua alert popup (show_alert = true) de khong spam them tin nhan
+                $telegram->traLoiCallback(
+                    $callbackId,
+                    "Loi khi tinh phi ship: {$e->getMessage()}",
+                    hienThiAlert: true,
                 );
                 return response()->json(['success' => true]);
             }
@@ -559,17 +701,12 @@ class TelegramWebhookController extends Controller
                     'trang_thai' => 'da_tinh_phi',
                 ]);
             } else {
-                $loi = $ketQuaPhi['error'] ?? 'Loi khong xac dinh';
+                $loiPhiShip = $ketQuaPhi['error'] ?? 'Loi khong xac dinh';
                 Log::warning('Tinh phi ship that bai', [
                     'ma_tin_nhan' => $banGhi->ma_tin_nhan,
                     'don_hang_id' => $donHang->id,
-                    'loi' => $loi,
+                    'loi' => $loiPhiShip,
                 ]);
-                $telegram->guiTinNhan(
-                    $banGhi->layMaKenh(),
-                    "Khong the tinh phi ship: {$loi}\n\n"
-                    . "Ban van co the tao van don, nhung can kiem tra lai ma quan/huyen cua shop va dia chi nguoi nhan."
-                );
 
                 // Van cap nhat shop da chon de khong bi ket
                 $donHang->update([
@@ -592,6 +729,13 @@ class TelegramWebhookController extends Controller
             'dich_vu_ghn' => $dichVuText,
         ]);
 
+        // Hien thi canh bao loi truc tiep trong tin tong ket (khong gui them tin rieng de tranh spam)
+        $canhBao = '';
+        if ($loiPhiShip !== null) {
+            $canhBao = "\n⚠️ Canh bao: {$loiPhiShip}\n"
+                . "Ban van co the tao van don, nhung can kiem tra lai ma quan/huyen cua shop va dia chi nguoi nhan.\n";
+        }
+
         // Hiển thị tổng kết
         $tongCong = $phiShip + $cod;
         $hangText = collect($duLieuAi['items'] ?? [])
@@ -613,6 +757,7 @@ class TelegramWebhookController extends Controller
         }
         $text .= "\n";
         $text .= "Tong cong: " . number_format($tongCong) . " VND\n";
+        $text .= $canhBao;
 
         $phims = [
             [['text' => 'Tao van don', 'callback_data' => 'tao_van_don']],
@@ -728,15 +873,17 @@ class TelegramWebhookController extends Controller
 
     private function xuLyTinNhanTrongFlowTaoDon(TinNhanTelegram $banGhi, string $noiDung, TelegramService $telegram): JsonResponse
     {
-        // Xử lý khi đang ở trạng thái da_xac_nhan (đã có don_hang, chờ nhập kích thước)
+        // Xu ly khi dang o trang thai da_xac_nhan hoac cho_sua (da co don_hang, cho nhap kich thuoc)
         if ($banGhi->trang_thai !== 'da_xac_nhan' && $banGhi->trang_thai !== 'cho_sua') {
             return response()->json(['success' => true]);
         }
 
-        // Tìm don_hang liên kết - cho ca 2 trang thai: cho_kien_hang (chua nhap kich thuoc)
-        // va da_nhap_kien (da co kien, dang cho chon shop)
+        // Tim don_hang lien ket - cho ca 3 trang thai:
+        // - cho_kien_hang: chua nhap kich thuoc
+        // - cho_can_nang: da co kich thuoc, dang cho nhap can nang
+        // - da_nhap_kien: da co kien, dang cho chon shop
         $donHang = DonHang::where('tin_nhan_telegram_id', $banGhi->id)
-            ->whereIn('trang_thai', ['cho_kien_hang', 'da_nhap_kien'])
+            ->whereIn('trang_thai', ['cho_kien_hang', 'cho_can_nang', 'da_nhap_kien'])
             ->orderBy('id', 'desc')
             ->first();
 
@@ -745,15 +892,20 @@ class TelegramWebhookController extends Controller
             return response()->json(['success' => true]);
         }
 
-        // Neu da nhap kien, bo qua parse - hien thi danh sach shop luon
+        // === Nhanh 1: don_hang dang cho_can_nang (da co kich thuoc, cho nhap can nang) ===
+        if ($donHang->trang_thai === 'cho_can_nang') {
+            return $this->xuLyNhapCanNang($banGhi, $donHang, $noiDung, $telegram);
+        }
+
+        // === Nhanh 2: don_hang da co kien (da_nhap_kien) - bo qua parse, hien thi danh sach shop ===
         if ($donHang->trang_thai === 'da_nhap_kien') {
             return $this->hienThiDanhSachShop($banGhi, $donHang, $telegram);
         }
 
-        // Parse kích thước
-        $kichThuoc = $this->parseKichThuoc($noiDung);
+        // === Nhanh 3: cho_kien_hang - parse kich thuoc moi ===
+        $ketQua = $this->phanTichKichThuoc($noiDung);
 
-        if (!$kichThuoc) {
+        if ($ketQua['status'] === ParseKichThuocResult::SAI_DINH_DANG) {
             $telegram->guiTinNhan(
                 $banGhi->layMaKenh(),
                 'Sai dinh dang. Nhap: Dai x Rong x Cao CanNang (gram)\n'
@@ -762,26 +914,125 @@ class TelegramWebhookController extends Controller
             return response()->json(['success' => true]);
         }
 
-        // Tạo kien_hang
+        if ($ketQua['status'] === ParseKichThuocResult::THIEU_CAN_NANG) {
+            // Luu tam kich thuoc vao du_lieu_ai, doi user nhap can nang
+            $kt = $ketQua['kich_thuoc'];
+            $duLieuHienTai = $banGhi->du_lieu_ai ?? [];
+            $duLieuHienTai['_kich_thuoc_cho_can_nang'] = [
+                'dai' => $kt['dai'],
+                'rong' => $kt['rong'],
+                'cao' => $kt['cao'],
+            ];
+            $banGhi->update(['du_lieu_ai' => $duLieuHienTai]);
+
+            $donHang->update(['trang_thai' => 'cho_can_nang']);
+
+            $telegram->guiTinNhan(
+                $banGhi->layMaKenh(),
+                "Ban nhap kich thuoc {$kt['dai']}x{$kt['rong']}x{$kt['cao']} cm rui, nhung chua co can nang.\n\n"
+                . "Nhap can nang bang gram (VD: 500) hoac kg (VD: 1.2kg):"
+            );
+
+            Log::info('Cho nhap can nang', [
+                'ma_tin_nhan' => $banGhi->ma_tin_nhan,
+                'don_hang_id' => $donHang->id,
+                'kich_thuoc' => $kt,
+            ]);
+
+            return response()->json(['success' => true]);
+        }
+
+        // === Nhanh 4: OK - co du D x R x C va can nang, tao kien_hang luon ===
+        $kt = $ketQua['kich_thuoc'];
         $kienHang = KienHang::create([
             'don_hang_id' => $donHang->id,
-            'dai' => $kichThuoc['dai'],
-            'rong' => $kichThuoc['rong'],
-            'cao' => $kichThuoc['cao'],
-            'can_nang' => $kichThuoc['can_nang'],
+            'dai' => $kt['dai'],
+            'rong' => $kt['rong'],
+            'cao' => $kt['cao'],
+            'can_nang' => $kt['can_nang'],
         ]);
 
-        // Cập nhật trạng thái don_hang
         $donHang->update(['trang_thai' => 'da_nhap_kien']);
 
         Log::info('Da nhap kich thuoc, cho chon shop', [
             'ma_tin_nhan' => $banGhi->ma_tin_nhan,
             'don_hang_id' => $donHang->id,
             'kien_hang_id' => $kienHang->id,
-            'kien_hang' => $kichThuoc,
+            'kien_hang' => $kt,
         ]);
 
-        // Hiển thị danh sách shop
+        return $this->hienThiDanhSachShop($banGhi, $donHang, $telegram);
+    }
+
+    /**
+     * Xu ly khi don_hang dang o trang thai cho_can_nang.
+     * User nhap mot so (gram) hoac co don vi (kg/g).
+     * Lay kich thuoc da luu tam trong du_lieu_ai['_kich_thuoc_cho_can_nang'] de tao kien_hang.
+     */
+    private function xuLyNhapCanNang(TinNhanTelegram $banGhi, DonHang $donHang, string $noiDung, TelegramService $telegram): JsonResponse
+    {
+        $canNang = $this->parseCanNang($noiDung);
+
+        if ($canNang === null) {
+            $telegram->guiTinNhan(
+                $banGhi->layMaKenh(),
+                "Can nang khong hop le. Nhap lai:\n"
+                . "- Gram: 500 hoac 500g\n"
+                . "- Kg: 1.2kg hoac 1kg 200g"
+            );
+            return response()->json(['success' => true]);
+        }
+
+        // Gioi han can nang (GHN cho phep toi da 30000g = 30kg)
+        if ($canNang <= 0 || $canNang > 30000) {
+            $telegram->guiTinNhan(
+                $banGhi->layMaKenh(),
+                "Can nang phai tu 1g den 30000g (30kg). Ban nhap: {$canNang}g"
+            );
+            return response()->json(['success' => true]);
+        }
+
+        // Lay kich thuoc da luu tam
+        $duLieuAi = $banGhi->du_lieu_ai ?? [];
+        $ktCho = $duLieuAi['_kich_thuoc_cho_can_nang'] ?? null;
+
+        if (!$ktCho) {
+            // Loi: khong co kich thuoc tam -> reset ve cho_kien_hang
+            Log::error('Khong tim thay kich thuoc tam khi dang cho can nang', [
+                'ma_tin_nhan' => $banGhi->ma_tin_nhan,
+                'don_hang_id' => $donHang->id,
+            ]);
+            $donHang->update(['trang_thai' => 'cho_kien_hang']);
+            $telegram->guiTinNhan(
+                $banGhi->layMaKenh(),
+                'Co loi xay ra, vui long nhap lai kich thuoc kien hang (VD: 20x30x10 500g):'
+            );
+            return response()->json(['success' => true]);
+        }
+
+        // Tao kien_hang
+        $kienHang = KienHang::create([
+            'don_hang_id' => $donHang->id,
+            'dai' => $ktCho['dai'],
+            'rong' => $ktCho['rong'],
+            'cao' => $ktCho['cao'],
+            'can_nang' => $canNang,
+        ]);
+
+        // Xoa co tam trong du_lieu_ai
+        unset($duLieuAi['_kich_thuoc_cho_can_nang']);
+        $banGhi->update(['du_lieu_ai' => $duLieuAi]);
+
+        $donHang->update(['trang_thai' => 'da_nhap_kien']);
+
+        Log::info('Da nhap can nang, tao kien hang', [
+            'ma_tin_nhan' => $banGhi->ma_tin_nhan,
+            'don_hang_id' => $donHang->id,
+            'kien_hang_id' => $kienHang->id,
+            'can_nang' => $canNang,
+        ]);
+
+        // Hien thi danh sach shop
         return $this->hienThiDanhSachShop($banGhi, $donHang, $telegram);
     }
 
@@ -818,43 +1069,110 @@ class TelegramWebhookController extends Controller
         return response()->json(['success' => true]);
     }
 
-    private function parseKichThuoc(string $input): ?array
+    /**
+     * Phan tich input kich thuoc kien hang. Tra ve:
+     * - status: ParseKichThuocResult::OK | THIEU_CAN_NANG | SAI_DINH_DANG
+     * - kich_thuoc: ['dai', 'rong', 'cao', 'can_nang' (neu OK)]
+     *
+     * Format hop le:
+     * - "20x30x10 500g"   -> OK
+     * - "20 x 30 x 10 500" -> OK
+     * - "20-30-10-500"    -> OK
+     * - "20x30x10"        -> THIEU_CAN_NANG
+     * - "abc"             -> SAI_DINH_DANG
+     *
+     * KHONG tu uoc tinh can nang (goi phuong an A: hoi lai khi thieu).
+     */
+    private function phanTichKichThuoc(string $input): array
     {
         $input = trim($input);
 
-        // Các format hỗ trợ:
-        // "20x30x10" - không có cân nặng
-        // "20x30x10 500g" - có cân nặng
-        // "20x30x10 - 500" - có cân nặng
-        // "20 x 30 x 10 500g" - có khoảng trắng
-        // "20-30-10-500" - dùng dấu gạch
+        // Pattern day du: D x R x C [CanNang (g)]
+        $patternDayDu = '/^(\d+)\s*[xX,\-]\s*(\d+)\s*[xX,\-]\s*(\d+)(?:\s*(?:[xX,\-]\s*)?(\d+)\s*g?)?$/i';
+        // Pattern chi kich thuoc: D x R x C (khong co can nang)
+        $patternKichThuoc = '/^(\d+)\s*[xX,\-]\s*(\d+)\s*[xX,\-]\s*(\d+)$/i';
 
-        // Pattern: 20x30x10, 20x30x10 500g, 20 x 30 x 10 - 500
-        $pattern = '/^(\d+)\s*[xX,\-]\s*(\d+)\s*[xX,\-]\s*(\d+)(?:\s*(?:[xX,\-]\s*)?(\d+)\s*g?)?$/i';
-
-        if (preg_match($pattern, $input, $matches)) {
+        // Thu pattern day du truoc
+        if (preg_match($patternDayDu, $input, $matches)) {
             $dai = (int) $matches[1];
             $rong = (int) $matches[2];
             $cao = (int) $matches[3];
-            $canNang = isset($matches[4]) ? (int) $matches[4] : null;
+            $canNang = isset($matches[4]) && $matches[4] !== '' ? (int) $matches[4] : null;
 
-            // Nếu không có cân nặng, ước tính
-            if ($canNang === null || $canNang < 100) {
-                // Ước tính: D x R x C / 5000, min 100g
-                $canNang = max((int) ($dai * $rong * $cao / 5000), 100);
+            if ($dai <= 0 || $rong <= 0 || $cao <= 0) {
+                return ['status' => ParseKichThuocResult::SAI_DINH_DANG, 'kich_thuoc' => null];
             }
 
-            // Validate
-            if ($dai <= 0 || $rong <= 0 || $cao <= 0) {
-                return null;
+            if ($canNang === null) {
+                return [
+                    'status' => ParseKichThuocResult::THIEU_CAN_NANG,
+                    'kich_thuoc' => ['dai' => $dai, 'rong' => $rong, 'cao' => $cao],
+                ];
             }
 
             return [
-                'dai' => $dai,
-                'rong' => $rong,
-                'cao' => $cao,
-                'can_nang' => $canNang,
+                'status' => ParseKichThuocResult::OK,
+                'kich_thuoc' => [
+                    'dai' => $dai,
+                    'rong' => $rong,
+                    'cao' => $cao,
+                    'can_nang' => $canNang,
+                ],
             ];
+        }
+
+        // Thu pattern chi kich thuoc (de phan biet "thieu can nang" voi "sai dinh dang")
+        if (preg_match($patternKichThuoc, $input, $matches)) {
+            $dai = (int) $matches[1];
+            $rong = (int) $matches[2];
+            $cao = (int) $matches[3];
+
+            if ($dai <= 0 || $rong <= 0 || $cao <= 0) {
+                return ['status' => ParseKichThuocResult::SAI_DINH_DANG, 'kich_thuoc' => null];
+            }
+
+            return [
+                'status' => ParseKichThuocResult::THIEU_CAN_NANG,
+                'kich_thuoc' => ['dai' => $dai, 'rong' => $rong, 'cao' => $cao],
+            ];
+        }
+
+        return ['status' => ParseKichThuocResult::SAI_DINH_DANG, 'kich_thuoc' => null];
+    }
+
+    /**
+     * Parse can nang tu input don gian (chi chua so + don vi gram/kg).
+     * Tra ve gram (int) hoac null neu khong hop le.
+     *
+     * Format hop le:
+     * - "500"   -> 500
+     * - "500g"  -> 500
+     * - "1.2kg" -> 1200
+     * - "1kg"   -> 1000
+     * - "1kg 200g" -> 1200
+     * - "1kg200" -> 1200
+     */
+    private function parseCanNang(string $input): ?int
+    {
+        $input = trim(mb_strtolower($input));
+        if ($input === '') {
+            return null;
+        }
+
+        // Loai bo khoang trang thua ngoai cung
+        $input = preg_replace('/\s+/', ' ', $input);
+
+        // Dinh dang "Xkg [Ygg]" hoac "Xkg"
+        // Vi du: "1.2kg 200g" -> kg=1.2, g=200
+        if (preg_match('/^(\d+(?:\.\d+)?)\s*kg(?:\s+(\d+)\s*g?)?$/i', $input, $m)) {
+            $kg = (float) $m[1];
+            $g = isset($m[2]) && $m[2] !== '' ? (int) $m[2] : 0;
+            return (int) round($kg * 1000) + $g;
+        }
+
+        // Dinh dang "Xg" hoac chi so "X"
+        if (preg_match('/^(\d+)\s*g?$/i', $input, $m)) {
+            return (int) $m[1];
         }
 
         return null;
